@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Prueba PsychoJS-web</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; background:#222; color:#eee; display:flex; flex-direction:column; align-items:center; padding:20px; }
+    .container { max-width:900px; width:100%; }
+    .screen { margin:20px 0; padding:20px; background:#2b2b2b; border-radius:8px; text-align:center; }
+    button { font-size:18px; padding:10px 18px; border-radius:6px; cursor:pointer; }
+    input[type="text"] { width:90%; font-size:18px; padding:8px 10px; border-radius:6px; border:1px solid #666; background:#111; color:#fff; }
+    .hidden { display:none; }
+    .small { font-size:14px; color:#bbb; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Experimento (versión web simple)</h1>
+
+    <div id="welcome" class="screen">
+      <p>Bienvenidx. Pulsa "Iniciar" para comenzar. (Esto desbloquea el audio en el navegador).</p>
+      <button id="btnStart">Iniciar</button>
+      <p class="small">Se generará un participant_id automáticamente. Solo se enviarán las respuestas de texto al Google Sheet.</p>
+    </div>
+
+    <div id="trialScreen" class="screen hidden">
+      <p id="trialNumber" style="font-weight:600"></p>
+      <audio id="audioPlayer" preload="auto"></audio>
+      <div style="margin-top:12px;">
+        <input id="txtResponse" type="text" placeholder="Escribe tu respuesta aquí" autocomplete="off" />
+      </div>
+      <div style="margin-top:12px;">
+        <button id="btnNext">Siguiente</button>
+      </div>
+      <p id="statusLine" class="small"></p>
+    </div>
+
+    <div id="endScreen" class="screen hidden">
+      <p>¡Gracias! Ya terminaste.</p>
+      <p class="small">Tus respuestas fueron enviadas (o guardadas localmente si hubo fallo de conexión).</p>
+    </div>
+  </div>
+<script>
+/* CONFIGURA ESTOS VALORES ANTES DE USAR */
+const ENDPOINT_URL = "https://script.google.com/macros/s/AKfycbyTZ6qUG6A4R6JqxabyI4_ef5_c5DlBCddJNMSC5Fjwgc0IkKkjKk6KqalFt50NTzl4/exec";
+const SECRET_TOKEN = "PsychoTry_2";
+
+/* Variables internas */
+let participant_id = 'ID-' + Date.now().toString() + '-' + Math.random().toString(36).substr(2,5);
+let trials = []; // cargado desde conditions.csv
+let currentIndex = -1;
+let startTime = 0;
+
+/* Helpers */
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/).map(l => l.trim()).filter(l => l.length>0);
+  if (!lines.length) return [];
+  const headers = lines[0].split(',').map(h=>h.trim());
+  const results = [];
+  for (let i=1;i<lines.length;i++){
+    const cols = lines[i].split(',').map(c=>c.trim());
+    const row = {};
+    for (let j=0;j<headers.length;j++){
+      row[headers[j]] = cols[j] !== undefined ? cols[j].replace(/^"|"$/g,'') : '';
+    }
+    results.push(row);
+  }
+  return results;
+}
+
+async function loadConditions() {
+  try {
+    const resp = await fetch('conditions.csv', {cache:'no-store'});
+    if (!resp.ok) throw new Error('No se pudo cargar conditions.csv: ' + resp.status);
+    const text = await resp.text();
+    const parsed = parseCSV(text);
+    trials = parsed.map(r => {
+      const audioFile = r.audioFile || r.audio || Object.values(r)[0] || '';
+      return { audioFile: audioFile, raw: r };
+    });
+  } catch (err) {
+    console.error(err);
+    alert('Error cargando conditions.csv: ' + err.message);
+  }
+}
+
+function showWelcome() {
+  document.getElementById('welcome').classList.remove('hidden');
+  document.getElementById('trialScreen').classList.add('hidden');
+  document.getElementById('endScreen').classList.add('hidden');
+}
+function showTrial() {
+  document.getElementById('welcome').classList.add('hidden');
+  document.getElementById('trialScreen').classList.remove('hidden');
+  document.getElementById('endScreen').classList.add('hidden');
+}
+function showEnd() {
+  document.getElementById('welcome').classList.add('hidden');
+  document.getElementById('trialScreen').classList.add('hidden');
+  document.getElementById('endScreen').classList.remove('hidden');
+}
+
+function sendToSheet(payload) {
+  if (!ENDPOINT_URL || !ENDPOINT_URL.startsWith('https')) {
+    console.warn('ENDPOINT_URL no configurado o inválido');
+    return Promise.resolve({status:'no-endpoint'});
+  }
+  const form = new URLSearchParams();
+  for (const k in payload) if (payload.hasOwnProperty(k) && payload[k] !== undefined && payload[k] !== null) form.append(k, String(payload[k]));
+  return fetch(ENDPOINT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString()
+  })
+  .then(r => r.text().then(txt => {
+    try { return JSON.parse(txt); } catch(e) { return { status: 'ok', raw: txt }; }
+  }));
+}
+
+function saveLocalFallback(payload) {
+  try {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'response-' + (payload.participant_id||'unknown') + '-' + Date.now() + '.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) { console.error('fallback save failed', e); }
+}
+
+async function nextTrial() {
+  const input = document.getElementById('txtResponse');
+  const status = document.getElementById('statusLine');
+
+  if (currentIndex >=0 && currentIndex < trials.length) {
+    const trial = trials[currentIndex];
+    const response_text = input.value || '';
+    const rt_ms = Math.round(performance.now() - startTime);
+    const payload = {
+      token: SECRET_TOKEN,
+      participant_id: participant_id,
+      trial_index: currentIndex,
+      stimulus: trial.audioFile || '',
+      response_text: response_text,
+      rt_ms: rt_ms
+    };
+    status.textContent = 'Enviando respuesta...';
+    try {
+      const res = await sendToSheet(payload);
+      console.log('Save result', res);
+      status.textContent = res && res.status === 'ok' ? 'Respuesta enviada' : ('Resultado: ' + JSON.stringify(res));
+    } catch (err) {
+      status.textContent = 'Fallo al enviar — guardando localmente';
+      saveLocalFallback(payload);
+    }
+  }
+
+  currentIndex++;
+  if (currentIndex >= trials.length) {
+    showEnd();
+    return;
+  }
+
+  const tnum = document.getElementById('trialNumber');
+  tnum.textContent = `Trial ${currentIndex+1} / ${trials.length}`;
+  const audioPlayer = document.getElementById('audioPlayer');
+  const nextTrialObj = trials[currentIndex];
+  audioPlayer.src = nextTrialObj.audioFile;
+  audioPlayer.load();
+  input.value = '';
+  input.focus();
+  startTime = performance.now();
+  status.textContent = '';
+
+  try { await audioPlayer.play(); } catch (err) { console.warn('audio play failed', err); }
+}
+
+/* Eventos */
+document.getElementById('btnStart').addEventListener('click', async () => {
+  await loadConditions();
+  if (!trials.length) {
+    alert('No se encontraron trials. Asegúrate de que conditions.csv está en la misma carpeta que index.html y que contiene la columna con rutas de audio.');
+    return;
+  }
+  currentIndex = -1;
+  showTrial();
+  document.getElementById('txtResponse').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      document.getElementById('btnNext').click();
+    }
+  });
+  nextTrial();
+});
+
+document.getElementById('btnNext').addEventListener('click', () => {
+  nextTrial();
+});
+
+showWelcome();
+console.log('participant_id:', participant_id);
+</script>
+</body>
+</html>
