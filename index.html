@@ -3,25 +3,33 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Prueba PsychoJS-web</title>
+  <title>Experimento — envío por bloque + descanso (mejorado)</title>
   <style>
     body { font-family: Arial, Helvetica, sans-serif; background:#222; color:#eee; display:flex; flex-direction:column; align-items:center; padding:20px; }
     .container { max-width:900px; width:100%; }
-    .screen { margin:20px 0; padding:20px; background:#2b2b2b; border-radius:8px; text-align:center; }
+    .screen { margin:20px 0; padding:20px; background:#2b2b2b; border-radius:8px; text-align:center; width:100%; }
     button { font-size:18px; padding:10px 18px; border-radius:6px; cursor:pointer; }
     input[type="text"] { width:90%; font-size:18px; padding:8px 10px; border-radius:6px; border:1px solid #666; background:#111; color:#fff; }
     .hidden { display:none; }
     .small { font-size:14px; color:#bbb; margin-top:8px; }
+    .countdown { font-size:36px; font-weight:700; margin-top:12px; }
+    .muted { color:#aaa; font-size:13px; margin-top:8px; }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>Experimento (versión web simple)</h1>
+    <h1>Experimento</h1>
 
     <div id="welcome" class="screen">
-      <p>Bienvenidx. Pulsa "Iniciar" para comenzar. (Esto desbloquea el audio en el navegador).</p>
+      <p>Pulsa "Iniciar" para comenzar. participant_id secuencial 1..99. Los datos de cada bloque se envían en segundo plano mientras ves el descanso.</p>
       <button id="btnStart">Iniciar</button>
-      <p class="small">Se generará un participant_id automáticamente. Solo se enviarán las respuestas de texto al Google Sheet.</p>
+      <p class="small">Entre bloques verás una pantalla de descanso con cuenta regresiva; al terminar el descanso podrás comenzar el siguiente bloque.</p>
+    </div>
+
+    <div id="blockScreen" class="screen hidden">
+      <p id="blockTitle" style="font-size:20px;font-weight:700"></p>
+      <p id="blockInfo" class="small"></p>
+      <button id="btnStartBlock">Comenzar Bloque</button>
     </div>
 
     <div id="trialScreen" class="screen hidden">
@@ -36,140 +44,396 @@
       <p id="statusLine" class="small"></p>
     </div>
 
+    <div id="breakScreen" class="screen hidden">
+      <p id="breakMessage" style="font-size:18px; font-weight:600">Descanso: preparate para el siguiente bloque</p>
+      <div class="countdown" id="countdown">30</div>
+      <div style="margin-top:12px;">
+        <button id="btnContinue" disabled>Continuar</button>
+      </div>
+      <p id="breakStatus" class="small"></p>
+    </div>
+
     <div id="endScreen" class="screen hidden">
-      <p>¡Gracias! Ya terminaste.</p>
-      <p class="small">Tus respuestas fueron enviadas (o guardadas localmente si hubo fallo de conexión).</p>
+      <p id="endMessage" style="font-size:18px; font-weight:600">¡Gracias! Ya terminaste.</p>
+      <p id="endDetail" class="small">Por favor NO cierres esta pestaña hasta que todos los datos se hayan enviado.</p>
+      <p id="uploadStatus" class="muted">Cargando... (<span id="pendingCount">0</span> respuestas pendientes)</p>
+      <p id="finalCloseNotice" class="small hidden">Ahora sí: ya podés cerrar esta pestaña. ¡Muchas gracias!</p>
     </div>
   </div>
+
 <script>
-/* CONFIGURA ESTOS VALORES ANTES DE USAR */
+/* CONFIG */
 const ENDPOINT_URL = "https://script.google.com/macros/s/AKfycbyTZ6qUG6A4R6JqxabyI4_ef5_c5DlBCddJNMSC5Fjwgc0IkKkjKk6KqalFt50NTzl4/exec";
 const SECRET_TOKEN = "PsychoTry_2";
+const VALIDATE_FILES = false;
+const BREAK_SECONDS = 30; // Cambiado a 30s según pedido
 
-/* Variables internas */
-let participant_id = 'ID-' + Date.now().toString() + '-' + Math.random().toString(36).substr(2,5);
-let trials = []; // cargado desde conditions.csv
-let currentIndex = -1;
+/* RUNTIME STATE */
+let participant_id = null;
+let seed = null;
+let blocks = [];
+let blockIndex = 0;
+let withinIndex = -1;
+let currentBlockItems = [];
 let startTime = 0;
 
-/* Helpers */
+/* Buffers y sets */
+let blockBuffer = [];         // buffer de filas del bloque actual
+const blockQueuedCsv = new Set();
+const globalPresentedCsv = new Set();
+const globalSentCsv = new Set();
+
+/* Upload tracking */
+let pendingUploadsCount = 0;   // contador de filas pendientes de subir
+let endScreenShown = false;    // si está visible la pantalla final
+
+/* UTILITIES */
 function parseCSV(text) {
-  const lines = text.trim().split(/\r?\n/).map(l => l.trim()).filter(l => l.length>0);
+  const lines = text.trim().split(/\r?\n/).map(l=>l.trim()).filter(l=>l.length>0);
   if (!lines.length) return [];
   const headers = lines[0].split(',').map(h=>h.trim());
-  const results = [];
+  const res = [];
   for (let i=1;i<lines.length;i++){
     const cols = lines[i].split(',').map(c=>c.trim());
     const row = {};
     for (let j=0;j<headers.length;j++){
       row[headers[j]] = cols[j] !== undefined ? cols[j].replace(/^"|"$/g,'') : '';
     }
-    results.push(row);
+    res.push(row);
   }
-  return results;
+  return res;
 }
 
-async function loadConditions() {
+function shuffleCrypto(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const u = new Uint32Array(1);
+    window.crypto.getRandomValues(u);
+    const j = Math.floor((u[0] / 4294967296) * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function encodePath(path) {
+  if (!path) return path;
   try {
-    const resp = await fetch('conditions.csv', {cache:'no-store'});
-    if (!resp.ok) throw new Error('No se pudo cargar conditions.csv: ' + resp.status);
-    const text = await resp.text();
-    const parsed = parseCSV(text);
-    trials = parsed.map(r => {
-      const audioFile = r.audioFile || r.audio || Object.values(r)[0] || '';
-      return { audioFile: audioFile, raw: r };
-    });
-  } catch (err) {
-    console.error(err);
-    alert('Error cargando conditions.csv: ' + err.message);
+    const url = new URL(path, window.location.href);
+    const pathname = url.pathname.split('/').map(s => encodeURIComponent(decodeURIComponent(s))).join('/');
+    return pathname + (url.search || '') + (url.hash || '');
+  } catch(e) {
+    return path.split('/').map(seg => encodeURIComponent(decodeURIComponent(seg))).join('/');
   }
 }
 
-function showWelcome() {
-  document.getElementById('welcome').classList.remove('hidden');
-  document.getElementById('trialScreen').classList.add('hidden');
-  document.getElementById('endScreen').classList.add('hidden');
+async function fileExists(path) {
+  if (!VALIDATE_FILES) return true;
+  const url = encodePath(path);
+  try { const h = await fetch(url, {method:'HEAD'}); if (h && (h.status===200||h.status===206)) return true; } catch(e){}
+  try { const g = await fetch(url, {method:'GET', headers:{Range:'bytes=0-1'}}); if (g && (g.status===200||g.status===206)) return true; } catch(e){}
+  return false;
 }
-function showTrial() {
-  document.getElementById('welcome').classList.add('hidden');
-  document.getElementById('trialScreen').classList.remove('hidden');
-  document.getElementById('endScreen').classList.add('hidden');
-}
-function showEnd() {
-  document.getElementById('welcome').classList.add('hidden');
-  document.getElementById('trialScreen').classList.add('hidden');
-  document.getElementById('endScreen').classList.remove('hidden');
+
+function getNextParticipantId() {
+  try {
+    const key = 'psycho_next_participant_id';
+    let next = Number(localStorage.getItem(key)) || 1;
+    if (!Number.isInteger(next) || next < 1) next = 1;
+    const assigned = next;
+    let newNext = next + 1;
+    if (newNext > 99) newNext = 1;
+    localStorage.setItem(key, String(newNext));
+    return assigned;
+  } catch(e) { return Math.floor(Math.random()*99)+1; }
 }
 
 function sendToSheet(payload) {
   if (!ENDPOINT_URL || !ENDPOINT_URL.startsWith('https')) {
-    console.warn('ENDPOINT_URL no configurado o inválido');
+    console.warn('ENDPOINT_URL no configurado');
     return Promise.resolve({status:'no-endpoint'});
   }
   const form = new URLSearchParams();
   for (const k in payload) if (payload.hasOwnProperty(k) && payload[k] !== undefined && payload[k] !== null) form.append(k, String(payload[k]));
-  return fetch(ENDPOINT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: form.toString()
-  })
-  .then(r => r.text().then(txt => {
-    try { return JSON.parse(txt); } catch(e) { return { status: 'ok', raw: txt }; }
-  }));
+  return fetch(ENDPOINT_URL, { method:'POST', headers:{ 'Content-Type':'application/x-www-form-urlencoded' }, body: form.toString() })
+    .then(r => r.text().then(txt => { try { return JSON.parse(txt); } catch(e) { return { status:'ok', raw: txt }; } }));
 }
 
-function saveLocalFallback(payload) {
+function sendSessionMetadata(pid, seed, blocks) {
   try {
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'response-' + (payload.participant_id||'unknown') + '-' + Date.now() + '.json';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  } catch (e) { console.error('fallback save failed', e); }
+    const flat = [];
+    blocks.forEach((b,bi) => b.items.forEach(it => flat.push(`${bi+1}:${it.csvIndex}`)));
+    const payload = { token: SECRET_TOKEN, participant_id: pid, event_type: 'session', seed: seed, selected: flat.join(';'), timestamp: new Date().toISOString() };
+    sendToSheet(payload).then(r => console.log('Session metadata saved', r)).catch(e => console.warn('Session metadata failed', e));
+  } catch(e) { console.warn(e); }
 }
 
+/* PREPARAR BLOQUES (igual que antes, completando hasta 12 si hay suficientes) */
+async function loadConditionsAndPrepareBlocks() {
+  blocks = [];
+  blockBuffer = [];
+  blockQueuedCsv.clear();
+  globalPresentedCsv.clear();
+
+  try {
+    const resp = await fetch('conditions.csv', { cache:'no-store' });
+    if (!resp.ok) throw new Error('No se pudo cargar conditions.csv: ' + resp.status);
+    const parsed = parseCSV(await resp.text());
+
+    const pathObjs = parsed.map((r, idx) => {
+      const p = r.stimuli || r.audioFile || r.audio || Object.values(r)[0] || '';
+      return { path: p, csvIndex: idx };
+    }).filter(o => o.path && o.path.length);
+
+    const groups = {};
+    for (const obj of pathObjs) {
+      const p = obj.path;
+      const m = p.match(/_conv_rir_(flat|low|high)(\d+)/i);
+      if (m) {
+        const type = m[1].toLowerCase();
+        const dist = m[1].toLowerCase() + m[2];
+        groups[type] = groups[type] || {};
+        groups[type][dist] = groups[type][dist] || [];
+        groups[type][dist].push(obj);
+      } else {
+        const type = /flat/i.test(p) ? 'flat' : (/low/i.test(p) ? 'low' : (/high/i.test(p) ? 'high' : 'other'));
+        const dm = p.match(/(flat|low|high)(\d+)/i);
+        const dist = dm ? dm[1].toLowerCase()+dm[2] : (type + '_0');
+        groups[type] = groups[type] || {};
+        groups[type][dist] = groups[type][dist] || [];
+        groups[type][dist].push(obj);
+      }
+    }
+
+    const blockOrder = ['flat','low','high'];
+    const prepared = [];
+    const globalUsedCsv = new Set(Array.from(globalSentCsv));
+
+    for (const type of blockOrder) {
+      if (!groups[type]) continue;
+      const distances = Object.keys(groups[type]).sort();
+      const allCandidates = [].concat(...distances.map(d => groups[type][d].slice()));
+      const target = Math.min(12, allCandidates.length);
+      const picksByDistance = {};
+
+      for (const d of distances) {
+        const candidates = shuffleCrypto(groups[type][d].slice());
+        const chosen = [];
+        for (const c of candidates) {
+          if (chosen.length >= 3) break;
+          if (globalUsedCsv.has(c.csvIndex)) continue;
+          if (!(await fileExists(c.path))) continue;
+          chosen.push(c);
+          globalUsedCsv.add(c.csvIndex);
+        }
+        picksByDistance[d] = chosen;
+      }
+
+      let picksFlat = [].concat(...Object.values(picksByDistance));
+      if (picksFlat.length < target) {
+        const pool = shuffleCrypto(allCandidates.slice());
+        for (const p of pool) {
+          if (picksFlat.length >= target) break;
+          if (globalUsedCsv.has(p.csvIndex)) continue;
+          if (!(await fileExists(p.path))) continue;
+          picksFlat.push(p);
+          globalUsedCsv.add(p.csvIndex);
+        }
+      }
+
+      const blockItems = shuffleCrypto(picksFlat);
+      prepared.push({ type, items: blockItems, debug: picksByDistance });
+      console.log(`Block ${type}: target=${target}, selected=${blockItems.length}`);
+    }
+
+    blocks = prepared;
+
+    const seen = new Set(); const dups = [];
+    blocks.forEach(b => b.items.forEach(it => { if (seen.has(it.csvIndex)) dups.push(it.csvIndex); else seen.add(it.csvIndex); }));
+    if (dups.length) console.error('DUPLICATES DETECTED in prepared blocks:', dups);
+    else console.log('Prepared blocks OK. Total selected:', seen.size);
+
+    blocks.forEach((b,bi) => {
+      console.group(`Block ${bi+1} (${b.type}) — ${b.items.length} items`);
+      b.items.forEach((it,i) => console.log(`  [${i+1}] csvIndex:${it.csvIndex} path:${it.path}`));
+      console.groupEnd();
+    });
+
+    sendSessionMetadata(participant_id, seed, blocks);
+
+  } catch (err) {
+    console.error('Error preparando bloques:', err);
+    alert('Error preparando bloques: ' + (err && err.message ? err.message : err));
+  }
+}
+
+/* Cuando termina un bloque: mostramos el break INMEDIATAMENTE y lanzamos el envío en background. */
+document.getElementById('btnStart').addEventListener('click', async () => {
+  participant_id = getNextParticipantId();
+  const rnd = (window.crypto && crypto.getRandomValues) ? crypto.getRandomValues(new Uint32Array(2)) : [Math.floor(Math.random()*1e9),0];
+  seed = `${participant_id}-${performance.now()}-${rnd[0]}-${rnd[1]}`;
+  console.log('START session -> participant_id:', participant_id, ' seed:', seed);
+
+  const btnStart = document.getElementById('btnStart');
+  btnStart.disabled = true;
+  await loadConditionsAndPrepareBlocks();
+  btnStart.disabled = false;
+
+  if (!blocks.length) { alert('No se prepararon bloques. Revisa la consola.'); return; }
+  blockIndex = 0; withinIndex = -1; currentBlockItems = blocks[blockIndex].items || [];
+  blockBuffer = []; blockQueuedCsv.clear();
+  showBlockScreen();
+});
+
+/* showBlockScreen siempre habilita el botón (soluciona "no me deja avanzar") */
+function showBlockScreen() {
+  document.getElementById('welcome').classList.add('hidden');
+  document.getElementById('blockScreen').classList.remove('hidden');
+  document.getElementById('trialScreen').classList.add('hidden');
+  document.getElementById('breakScreen').classList.add('hidden');
+  document.getElementById('endScreen').classList.add('hidden');
+  const t = (blocks[blockIndex] && blocks[blockIndex].type) ? blocks[blockIndex].type : 'N/A';
+  document.getElementById('blockTitle').textContent = `Bloque ${blockIndex+1} — ${t.toUpperCase()}`;
+  document.getElementById('blockInfo').textContent = `Este bloque contiene ${blocks[blockIndex].items.length} ensayos.`;
+  // habilitar el botón por si estaba deshabilitado
+  document.getElementById('btnStartBlock').disabled = false;
+}
+
+/* Iniciar bloque: deshabilita el btn mientras está corriendo */
+document.getElementById('btnStartBlock').addEventListener('click', () => {
+  const btn = document.getElementById('btnStartBlock');
+  btn.disabled = true;
+  currentBlockItems = blocks[blockIndex].items || [];
+  withinIndex = -1;
+  blockBuffer = []; blockQueuedCsv.clear();
+  console.log(`--- STARTING BLOCK ${blockIndex+1} (${blocks[blockIndex].type}) items:${currentBlockItems.length} ---`);
+  currentBlockItems.forEach((p,i) => console.log(`  [${i+1}] csvIndex:${p.csvIndex} path:${p.path}`));
+  nextTrial();
+});
+
+/* Debounce next */
+let nextLock = false;
+document.getElementById('btnNext').addEventListener('click', () => {
+  if (nextLock) { console.warn('Next click ignored (debounce)'); return; }
+  nextLock = true;
+  setTimeout(() => { nextLock = false; }, 350);
+  nextTrial();
+});
+
+/* Helpers para tracking de uploads y UI del final */
+function updateUploadUI() {
+  const pendingEl = document.getElementById('pendingCount');
+  if (pendingEl) pendingEl.textContent = String(pendingUploadsCount);
+  if (!endScreenShown) return;
+  const endDetail = document.getElementById('endDetail');
+  const finalCloseNotice = document.getElementById('finalCloseNotice');
+  const endMessage = document.getElementById('endMessage');
+  if (pendingUploadsCount > 0) {
+    if (endDetail) endDetail.textContent = 'Por favor NO cierres esta pestaña hasta que todos los datos se hayan enviado.';
+    if (finalCloseNotice) finalCloseNotice.classList.add('hidden');
+    if (endMessage) endMessage.textContent = '¡Gracias! Enviando datos...';
+  } else {
+    if (endDetail) endDetail.textContent = 'Todos los datos fueron enviados correctamente.';
+    if (finalCloseNotice) finalCloseNotice.classList.remove('hidden');
+    if (endMessage) endMessage.textContent = '¡Gracias!';
+  }
+}
+
+/* NEXT: ENCOLAR respuestas en buffer, presentar siguiente. Si fin de bloque: mostrar break y enviar buffer en background */
 async function nextTrial() {
   const input = document.getElementById('txtResponse');
   const status = document.getElementById('statusLine');
 
-  if (currentIndex >=0 && currentIndex < trials.length) {
-    const trial = trials[currentIndex];
-    const response_text = input.value || '';
-    const rt_ms = Math.round(performance.now() - startTime);
-    const payload = {
-      token: SECRET_TOKEN,
-      participant_id: participant_id,
-      trial_index: currentIndex,
-      stimulus: trial.audioFile || '',
-      response_text: response_text,
-      rt_ms: rt_ms
-    };
-    status.textContent = 'Enviando respuesta...';
-    try {
-      const res = await sendToSheet(payload);
-      console.log('Save result', res);
-      status.textContent = res && res.status === 'ok' ? 'Respuesta enviada' : ('Resultado: ' + JSON.stringify(res));
-    } catch (err) {
-      status.textContent = 'Fallo al enviar — guardando localmente';
-      saveLocalFallback(payload);
+  if (withinIndex >= 0 && withinIndex < currentBlockItems.length) {
+    const prev = currentBlockItems[withinIndex];
+    if (!blockQueuedCsv.has(prev.csvIndex) && !globalSentCsv.has(prev.csvIndex)) {
+      const response_text = input.value || '';
+      const rt_ms = Math.round(performance.now() - startTime);
+      const payload = {
+        token: SECRET_TOKEN,
+        participant_id: participant_id,
+        Bloque: blockIndex + 1,
+        trial_index: prev.csvIndex,
+        trial_index_within_block: withinIndex,
+        stimulus: prev.path || '',
+        response_text: response_text,
+        rt_ms: rt_ms
+      };
+      blockBuffer.push(payload);
+      blockQueuedCsv.add(prev.csvIndex);
+      console.log('Encolada respuesta para blockBuffer csvIndex:', prev.csvIndex);
+    } else {
+      console.log('Prev already queued or sent, skipping queue for csvIndex', prev.csvIndex);
     }
   }
 
-  currentIndex++;
-  if (currentIndex >= trials.length) {
-    showEnd();
-    return;
+  withinIndex++;
+  while (withinIndex < currentBlockItems.length && globalPresentedCsv.has(currentBlockItems[withinIndex].csvIndex)) {
+    console.warn('Skipping already presented csvIndex', currentBlockItems[withinIndex].csvIndex);
+    withinIndex++;
+  }
+
+  if (withinIndex >= currentBlockItems.length) {
+    // fin bloque: iniciar envío en background usando copia del buffer
+    const bufferToSend = blockBuffer.slice();
+    // clear buffer immediately so UI can reuse blockBuffer for next block
+    blockBuffer = [];
+    blockQueuedCsv.clear();
+
+    // lanzar envío en background (no await), se enviará secuencialmente
+    const sendPromise = (async () => {
+      await sendBlockBuffer(bufferToSend, blockIndex+1);
+    })();
+
+    // Si este era el ÚLTIMO bloque, no mostramos descanso: mostramos pantalla final inmediatamente.
+    const isLastBlock = (blockIndex + 1) >= blocks.length;
+    if (isLastBlock) {
+      // Mostrar pantalla final con aviso "no cerrar" y dejar envíos en background
+      showEnd();
+      return;
+    }
+
+    // mostrar descanso AHORA (mientras se envía en background)
+    await showBreakThenContinue();
+
+    // una vez terminado el descanso mostramos la pantalla del siguiente bloque y habilitamos botón
+    blockIndex++;
+    if (blockIndex >= blocks.length) {
+      // si no hay más bloques, esperar a que termine el envío antes de finalizar (opcional)
+      try { await sendPromise; } catch(e){ console.warn('background send failed', e); }
+      showEnd();
+      return;
+    } else {
+      // preparaciones para el siguiente bloque (no esperamos a que sendPromise termine)
+      currentBlockItems = blocks[blockIndex].items || [];
+      withinIndex = -1;
+      // reset buffer para el próximo bloque
+      blockBuffer = [];
+      blockQueuedCsv.clear();
+      // habilitar botón de inicio del bloque siguiente
+      showBlockScreen();
+      // NOTE: sendPromise may still be running in background; that's OK
+      return;
+    }
+  }
+
+  // presentar siguiente trial
+  if (typeof showTrialScreen === 'function') {
+    showTrialScreen();
+  } else {
+    // fallback si por alguna razón la función no está definida
+    document.getElementById('trialScreen').classList.remove('hidden');
+    document.getElementById('welcome').classList.add('hidden');
   }
 
   const tnum = document.getElementById('trialNumber');
-  tnum.textContent = `Trial ${currentIndex+1} / ${trials.length}`;
+  tnum.textContent = `Bloque ${blockIndex+1} — Trial ${withinIndex+1} / ${currentBlockItems.length}`;
   const audioPlayer = document.getElementById('audioPlayer');
-  const nextTrialObj = trials[currentIndex];
-  audioPlayer.src = nextTrialObj.audioFile;
+  const nextStim = currentBlockItems[withinIndex];
+
+  globalPresentedCsv.add(nextStim.csvIndex);
+  console.log(`PRESENT -> Bloque:${blockIndex+1} Trial:${withinIndex+1} csvIndex:${nextStim.csvIndex} path:${nextStim.path}`);
+
+  audioPlayer.src = encodePath(nextStim.path);
   audioPlayer.load();
   input.value = '';
   input.focus();
@@ -179,30 +443,139 @@ async function nextTrial() {
   try { await audioPlayer.play(); } catch (err) { console.warn('audio play failed', err); }
 }
 
-/* Eventos */
-document.getElementById('btnStart').addEventListener('click', async () => {
-  await loadConditions();
-  if (!trials.length) {
-    alert('No se encontraron trials. Asegúrate de que conditions.csv está en la misma carpeta que index.html y que contiene la columna con rutas de audio.');
+/* Enviar buffer (secuencia) — recibe buffer param (copia) */
+async function sendBlockBuffer(bufferParam, blockNumber) {
+  const status = document.getElementById('statusLine');
+  if (!bufferParam || !bufferParam.length) {
+    console.log('No hay filas para enviar para bloque', blockNumber);
     return;
   }
-  currentIndex = -1;
-  showTrial();
-  document.getElementById('txtResponse').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      document.getElementById('btnNext').click();
-    }
-  });
-  nextTrial();
-});
+  // Incrementar contador de uploads pendientes con el número de filas que vamos a mandar
+  pendingUploadsCount += bufferParam.length;
+  updateUploadUI();
 
-document.getElementById('btnNext').addEventListener('click', () => {
-  nextTrial();
-});
+  status.textContent = `Enviando ${bufferParam.length} respuestas del Bloque ${blockNumber}...`;
+  console.log(`Sending block ${blockNumber} buffer (${bufferParam.length} rows)`);
+
+  for (const payload of bufferParam) {
+    const csvIdx = payload.trial_index;
+    if (globalSentCsv.has(csvIdx)) {
+      console.log('Skipping already-sent csvIndex', csvIdx);
+      // si se saltea, decrementamos igualmente el contador porque esa fila no quedará pendiente
+      pendingUploadsCount = Math.max(0, pendingUploadsCount - 1);
+      updateUploadUI();
+      continue;
+    }
+    // marcar como enviado optimistamente
+    globalSentCsv.add(csvIdx);
+    try {
+      const res = await sendToSheet(payload);
+      console.log('Block send result for csvIndex', csvIdx, res);
+    } catch (e) {
+      console.warn('Error sending csvIndex', csvIdx, e);
+      // guardar localmente el payload fallido para facilitar recuperación
+      const blob = new Blob([JSON.stringify(payload,null,2)], {type:'application/json'});
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `response-failed-${participant_id}-${csvIdx}.json`; document.body.appendChild(a); a.click(); a.remove();
+    } finally {
+      // siempre decrementamos el contador (envío completado o fallido)
+      pendingUploadsCount = Math.max(0, pendingUploadsCount - 1);
+      updateUploadUI();
+    }
+  }
+
+  status.textContent = `Bloque ${blockNumber} enviado (${bufferParam.length} filas)`;
+  console.log(`Block ${blockNumber} buffer sent & cleared.`);
+}
+
+/* Break screen: muestra countdown e habilita "Continuar" */
+function sleep(ms){ return new Promise(resolve => setTimeout(resolve, ms)); }
+async function showBreakThenContinue() {
+  document.getElementById('trialScreen').classList.add('hidden');
+  document.getElementById('blockScreen').classList.add('hidden');
+  document.getElementById('welcome').classList.add('hidden');
+  document.getElementById('breakScreen').classList.remove('hidden');
+  document.getElementById('endScreen').classList.add('hidden');
+
+  const countdownEl = document.getElementById('countdown');
+  const btnContinue = document.getElementById('btnContinue');
+  const breakStatus = document.getElementById('breakStatus');
+  btnContinue.disabled = true;
+  breakStatus.textContent = 'En descanso...';
+
+  let remaining = BREAK_SECONDS;
+  countdownEl.textContent = String(remaining);
+  while (remaining > 0) {
+    await sleep(1000);
+    remaining--;
+    countdownEl.textContent = String(remaining);
+  }
+  breakStatus.textContent = 'Listo — pulsa continuar cuando estés preparado';
+  btnContinue.disabled = false;
+
+  // auto continue después de 5s si no pulsa
+  let autoTimeout = setTimeout(() => { if (!btnContinue.disabled) btnContinue.click(); }, 5000);
+
+  return new Promise(resolve => {
+    btnContinue.onclick = () => {
+      clearTimeout(autoTimeout);
+      btnContinue.disabled = true;
+      document.getElementById('breakScreen').classList.add('hidden');
+      resolve();
+    };
+  });
+}
+
+/* --- AGREGADA: showTrialScreen --- 
+   Definición clara y simple para evitar ReferenceError y preparar UI del trial.
+*/
+function showTrialScreen() {
+  document.getElementById('welcome').classList.add('hidden');
+  document.getElementById('blockScreen').classList.add('hidden');
+  document.getElementById('trialScreen').classList.remove('hidden');
+  document.getElementById('breakScreen').classList.add('hidden');
+  document.getElementById('endScreen').classList.add('hidden');
+
+  // Preparar elementos del trial
+  const input = document.getElementById('txtResponse');
+  if (input) { input.value = ''; input.focus(); }
+
+  const btnNext = document.getElementById('btnNext');
+  if (btnNext) { btnNext.disabled = false; }
+
+  // Opcional: limpiar statusLine
+  const status = document.getElementById('statusLine');
+  if (status) status.textContent = '';
+}
+
+/* UI helpers */
+function showWelcome(){ 
+  endScreenShown = false;
+  document.getElementById('welcome').classList.remove('hidden'); 
+  document.getElementById('blockScreen').classList.add('hidden'); 
+  document.getElementById('trialScreen').classList.add('hidden'); 
+  document.getElementById('breakScreen').classList.add('hidden'); 
+  document.getElementById('endScreen').classList.add('hidden');
+}
+function showEnd(){ 
+  endScreenShown = true;
+  document.getElementById('welcome').classList.add('hidden'); 
+  document.getElementById('blockScreen').classList.add('hidden'); 
+  document.getElementById('trialScreen').classList.add('hidden'); 
+  document.getElementById('breakScreen').classList.add('hidden'); 
+  document.getElementById('endScreen').classList.remove('hidden'); 
+  // Actualizar UI de upload inmediatamente
+  updateUploadUI();
+  // Si no hay pendientes, mostrar aviso final inmediatamente
+  if (pendingUploadsCount === 0) {
+    document.getElementById('finalCloseNotice').classList.remove('hidden');
+  }
+}
+
+const audioPlayer = document.getElementById('audioPlayer');
+audioPlayer.addEventListener('error', (e) => console.error('Audio error', audioPlayer.error, audioPlayer.networkState, audioPlayer.readyState));
+audioPlayer.addEventListener('ended', () => console.log('Audio ended'));
 
 showWelcome();
-console.log('participant_id:', participant_id);
 </script>
 </body>
 </html>
