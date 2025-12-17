@@ -449,7 +449,7 @@ async function loadConditionsAndPrepareBlocks() {
       const trainingItems = [];
       for (let ti = 1; ti <= 4; ti++) {
         // Ruta siguiendo el patrón observado en conditions.csv
-        const trainPath = `stimuli/Vidrios_Conv_${ti}_conv_rir_${type}${ti}.wav_rov+00dB.wav`;
+        const trainPath = `stimuli/pink_noise_conv_${ti}_conv_rir_${type}${ti}.wav_rov+00dB.wav`;
         trainingItems.push({ path: trainPath, csvIndex: `train_${type}_${ti}`, training: true });
       }
       // Randomizar el orden de los trials de entrenamiento
